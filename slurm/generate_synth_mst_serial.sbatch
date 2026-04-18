@@ -3,8 +3,8 @@
 #SBATCH --output=logs/mst_synth_serial_%j.out
 #SBATCH --error=logs/mst_synth_serial_%j.err
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=120:00:00
+#SBATCH --mem=32G
+#SBATCH --time=1:00:00
 ##SBATCH --account=YOUR_ACCOUNT
 ##SBATCH --partition=YOUR_PARTITION
 
