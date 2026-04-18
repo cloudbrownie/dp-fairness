@@ -19,10 +19,10 @@ GAPS = ("dp_gap", "eo_gap")
 SEED_SENTINEL = -1.0  # for merging clean baseline (synth_seed is NaN)
 
 
-def load_all(results_dir: Path) -> pd.DataFrame:
+def load_all(results_dir: Path, baseline_dir: Path = Path(".")) -> pd.DataFrame:
     rows = []
     for model, (base_name, grid_dir) in MODELS.items():
-        base = pd.read_csv(results_dir / base_name)
+        base = pd.read_csv(baseline_dir / base_name)
         base["eps"] = np.inf
         base["synth_seed"] = SEED_SENTINEL
         base["model"] = model
@@ -36,15 +36,41 @@ def load_all(results_dir: Path) -> pd.DataFrame:
 
 
 def compute_ratios(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-seed benefit preservation ratio: synth_benefit / clean_benefit.
+
+    For each (model, intervention ≠ unmitigated, synth_seed):
+        ratio = (unmitigated_synth_gap - intervention_synth_gap)
+              / (unmitigated_clean_gap - intervention_clean_gap)
+    Interpreted as the fraction of the intervention's clean-data fairness benefit
+    that survives DP synthesis.
+      ratio = 1  → DP fully preserved the benefit.
+      ratio = 0  → DP fully erased the benefit.
+      ratio < 0  → intervention backfires (synth gap worse than unmitigated).
+      ratio > 1  → DP amplified the benefit (unusual).
+    """
     unm = (
         df.query("intervention == 'unmitigated'")
         .rename(columns={g: f"{g}_unm" for g in GAPS})
         [["model", "eps", "synth_seed", *(f"{g}_unm" for g in GAPS)]]
     )
-    inter = df.query("intervention != 'unmitigated'").copy()
-    merged = inter.merge(unm, on=["model", "eps", "synth_seed"], how="left", validate="many_to_one")
+    inter = df.query("intervention != 'unmitigated'")
+    paired = inter.merge(
+        unm, on=["model", "eps", "synth_seed"], how="inner", validate="many_to_one"
+    )
+
+    clean = paired[~np.isfinite(paired["eps"])].copy()
     for g in GAPS:
-        merged[f"{g.split('_')[0]}_ratio"] = merged[g] / merged[f"{g}_unm"]
+        clean[f"{g}_clean_benefit"] = clean[f"{g}_unm"] - clean[g]
+    clean_benefit = clean[["model", "intervention", *(f"{g}_clean_benefit" for g in GAPS)]]
+
+    synth = paired[np.isfinite(paired["eps"])].copy()
+    for g in GAPS:
+        synth[f"{g}_synth_benefit"] = synth[f"{g}_unm"] - synth[g]
+
+    merged = synth.merge(clean_benefit, on=["model", "intervention"], how="left", validate="many_to_one")
+    for g in GAPS:
+        key = g.split("_")[0]
+        merged[f"{key}_ratio"] = merged[f"{g}_synth_benefit"] / merged[f"{g}_clean_benefit"]
     return merged
 
 
@@ -231,13 +257,20 @@ _EPS_ORDER = [1.0, 2.0, 4.0, 8.0, np.inf]
 _X_LABELS = ["1", "2", "4", "8", "clean"]
 
 
-def _render_grid(summary: pd.DataFrame, metrics, out_path: Path, suptitle: str) -> None:
+def _render_grid(
+    summary: pd.DataFrame, metrics, out_path: Path, suptitle: str,
+    include_clean: bool = True,
+) -> None:
     import matplotlib.pyplot as plt
 
     models = sorted(summary["model"].unique())
     colors = _COLORS
-    eps_order = _EPS_ORDER
-    x_labels = _X_LABELS
+    if include_clean:
+        eps_order = _EPS_ORDER
+        x_labels = _X_LABELS
+    else:
+        eps_order = _EPS_ORDER[:-1]
+        x_labels = _X_LABELS[:-1]
     x_pos = list(range(len(eps_order)))
 
     fig, axes = plt.subplots(
@@ -263,18 +296,20 @@ def _render_grid(summary: pd.DataFrame, metrics, out_path: Path, suptitle: str) 
                         means.append(row[f"{metric}_mean"])
                         los.append(row[f"{metric}_ci_lo"])
                         his.append(row[f"{metric}_ci_hi"])
-                # ε ∈ {1,2,4,8}: line + CI
-                ax.plot(x_pos[:4], means[:4], marker="o", color=c, label=inter)
-                ax.fill_between(x_pos[:4], los[:4], his[:4], alpha=0.2, color=c)
-                # clean: ★ marker, no CI
-                ax.scatter(
-                    x_pos[4], means[4], marker="*", s=220, color=c,
-                    edgecolor="black", linewidth=0.6, zorder=3,
-                )
+                n_synth = 4
+                ax.plot(x_pos[:n_synth], means[:n_synth], marker="o", color=c, label=inter)
+                ax.fill_between(x_pos[:n_synth], los[:n_synth], his[:n_synth], alpha=0.2, color=c)
+                if include_clean:
+                    ax.scatter(
+                        x_pos[n_synth], means[n_synth], marker="*", s=220, color=c,
+                        edgecolor="black", linewidth=0.6, zorder=3,
+                    )
 
             if metric.endswith("_ratio"):
                 ax.axhline(1.0, color="k", linestyle="--", alpha=0.5, linewidth=0.8)
-            ax.axvline(3.5, color="gray", linestyle=":", alpha=0.4, linewidth=0.8)
+                ax.axhline(0.0, color="k", linestyle=":", alpha=0.6, linewidth=0.8)
+            if include_clean:
+                ax.axvline(3.5, color="gray", linestyle=":", alpha=0.4, linewidth=0.8)
             ax.set_xticks(x_pos)
             ax.set_xticklabels(x_labels)
             ax.set_xlabel("ε (privacy budget)")
@@ -293,7 +328,9 @@ def _render_grid(summary: pd.DataFrame, metrics, out_path: Path, suptitle: str) 
 def make_plot(summary: pd.DataFrame, out_path: Path) -> None:
     _render_grid(
         summary, RATIO_METRICS, out_path,
-        "Fairness intervention vs. unmitigated: gap ratio across ε (★ = clean baseline)",
+        "Benefit preservation ratio: synth_benefit / clean_benefit "
+        "(1 = benefit preserved; 0 = erased; <0 = backfire)",
+        include_clean=False,
     )
 
 
@@ -346,6 +383,7 @@ def make_scatter_plot(df: pd.DataFrame, out_path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", type=Path, default=Path("data/results"))
+    p.add_argument("--baseline-dir", type=Path, default=Path("."))
     p.add_argument("--summary-out", type=Path, default=Path("data/results/summary.csv"))
     p.add_argument("--long-out", type=Path, default=Path("data/results/ratios_long.csv"))
     p.add_argument("--plot-out", type=Path, default=Path("data/results/ratios_plot.png"))
@@ -364,7 +402,7 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    df = load_all(args.results_dir)
+    df = load_all(args.results_dir, args.baseline_dir)
     logging.info("loaded %d rows (%s)", len(df), ", ".join(sorted(df["model"].unique())))
 
     ratios = compute_ratios(df)
