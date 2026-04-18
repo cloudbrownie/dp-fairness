@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "${ROOT}"
 
-mkdir -p logs results
+mkdir -p logs data/results
 
 if [[ -f "${ROOT}/.venv/bin/activate" ]]; then
   # shellcheck source=/dev/null
@@ -31,6 +31,6 @@ export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
 exec python train_baseline.py \
   --data-dir data/raw \
-  --output-dir results \
+  --output-dir data/results \
   --expgrad-subsample 0 \
   --seed 42

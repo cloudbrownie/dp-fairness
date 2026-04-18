@@ -19,7 +19,7 @@ set -euo pipefail
 ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "${ROOT}"
 
-mkdir -p logs results/grid
+mkdir -p logs data/results/grid
 
 EPS_LIST=(1 2 4 8)
 N_SEEDS=10   # seeds 0..4; change to 10 and array to 0-39 for full grid
@@ -43,7 +43,7 @@ export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 exec python train_grid.py \
   --data-dir    data/raw \
   --synth-dir   data/synth \
-  --output-dir  results/grid \
+  --output-dir  data/results/grid \
   --epsilon     "${EPS}" \
   --synth-seed  "${SYNTH_SEED}" \
   --expgrad-subsample 20000 \

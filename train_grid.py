@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/grid"),
+        default=Path("data/results/grid"),
         help="Directory for per-task CSVs.",
     )
     p.add_argument(

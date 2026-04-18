@@ -7,6 +7,7 @@ dependencies = [
     "dpmm==0.1.9",
     "fairlearn==0.13.0",
     "folktables==0.0.12",
+    "huggingface-hub>=1.11.0",
     "numpy==1.26.4",
     "pandas==2.1.0",
     "scikit-learn==1.5.0",
