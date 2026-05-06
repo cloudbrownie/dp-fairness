@@ -5,9 +5,14 @@
 #SBATCH --array=0-39
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH --time=1:30:00
+#SBATCH --time=4:00:00
 
-# One array task = one (epsilon, seed) pair, all four interventions.
+# One array task = one (epsilon, seed) pair. Ten cells per task:
+# unmitigated, reweighing (DP), expgrad-{dp,eo} x {uniform,stratified},
+# threshold-{dp,eo} x {naive,honest}. expgrad runs 4 times per task
+# (was 1 before DP/EO split, then 2 after); 4:00:00 covers the slowest
+# eps=8 stratified-EO seeds with headroom.
+#
 # Array size 0-19: eps in {1,2,4,8} x seed in {0..4} (5 seeds).
 # Change to 0-39 for all 10 seeds.
 #
@@ -47,4 +52,5 @@ exec python train_grid.py \
   --epsilon     "${EPS}" \
   --synth-seed  "${SYNTH_SEED}" \
   --expgrad-subsample 20000 \
+  --min-per-group 200 \
   --seed        42

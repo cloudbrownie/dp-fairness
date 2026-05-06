@@ -5,9 +5,13 @@
 #SBATCH --array=0-39
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=1:30:00
+#SBATCH --time=4:00:00
 
-# One array task = one (epsilon, seed) pair, all four interventions.
+# One array task = one (epsilon, seed) pair. Ten cells per task:
+# unmitigated, reweighing (DP), expgrad-{dp,eo} x {uniform,stratified},
+# threshold-{dp,eo} x {naive,honest}. expgrad runs 4 times per task; XGB
+# expgrad costs ~3-6 min each on 4 CPUs, so 4h covers worst case + headroom.
+#
 # Array size 0-19: eps in {1,2,4,8} x seed in {0..4} (5 seeds).
 # Change to 0-39 for all 10 seeds.
 #
@@ -15,11 +19,11 @@
 # EPS_IDX: 0=eps1, 1=eps2, 2=eps4, 3=eps8
 #
 # Estimated wall time per task (4 CPUs):
-#   unmitigated  ~5-15s
-#   reweighting  ~5-15s
-#   expgrad      ~3-6 min  (n_estimators=300, subsample=20k)
-#   threshold    ~15-30s
-# Total: ~5-8 min; 0:45:00 is a conservative buffer for the first run.
+#   unmitigated      ~5-15s
+#   reweighing      ~5-15s
+#   expgrad x 2      ~6-12 min total  (n_estimators=300, subsample=20k, run for DP + EO)
+#   threshold x 2    ~30-60s total
+# Total: ~10-15 min; 2:30:00 is a conservative buffer for the first run.
 
 set -euo pipefail
 
@@ -56,4 +60,5 @@ exec python train_grid_xgb.py \
   --epsilon     "${EPS}" \
   --synth-seed  "${SYNTH_SEED}" \
   --expgrad-subsample 20000 \
+  --min-per-group 200 \
   --seed        42

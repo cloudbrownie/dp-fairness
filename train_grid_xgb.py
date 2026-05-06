@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Step 4b: Main experiment grid — DP synthetic data × fairness interventions — XGBoost.
 
-One Slurm array task = one (epsilon, seed) pair. Runs all four interventions
-on the corresponding synthetic training set and evaluates on the fixed clean
-test split.
+One Slurm array task = one (epsilon, seed) pair. Runs ten (intervention,
+target_gap, variant) cells on the corresponding synthetic training set and
+evaluates on the fixed clean test split:
 
-Writes results/grid_xgb/eps{e}_seed{s}.csv (one row per intervention). A
-separate merge step combines these into results/grid_xgb.csv.
+  - unmitigated                                   (target_gap=none, variant=none)
+  - reweighing                                   (target_gap=dp,   variant=none)
+  - expgrad / {dp, eo} × {uniform, stratified}    (4 cells)
+  - threshold / {dp, eo} × {naive, honest}        (4 cells)
 
-Columns: eps, synth_seed, intervention, accuracy, auc, dp_gap, eo_gap
+See train_grid.py for the rationale on why reweighing has no EO variant
+and the meaning of the expgrad/threshold variants.
+
+Writes results/grid_xgb/eps{e}_seed{s}.csv with columns:
+  eps, synth_seed, intervention, target_gap, variant, accuracy, auc, dp_gap, eo_gap
 
 Key differences from train_grid.py (LogisticRegression):
   - base_clf() returns XGBClassifier with hist tree method.
@@ -40,7 +46,7 @@ from train_baseline_xgb import (
     find_prepared_table,
     make_preprocessor,
     run_expgrad,
-    run_reweighting,
+    run_reweighing,
     run_threshold,
     run_unmitigated,
     set_seeds,
@@ -66,6 +72,52 @@ def load_synth(synth_path: Path) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     return X, y, A
 
 
+def _safe_call(
+    cell_name: str,
+    intervention: str,
+    target_gap: str,
+    variant: str,
+    fn,
+) -> dict[str, Any]:
+    # See train_grid.py::_safe_call for rationale.
+    t0 = time.perf_counter()
+    try:
+        r = fn()
+        r.setdefault("intervention", intervention)
+        r["target_gap"] = target_gap
+        r["variant"] = variant
+        r.setdefault("error", "")
+        logging.info("done: %s (%.1fs)  %s", cell_name, time.perf_counter() - t0, r)
+        return r
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        logging.exception("FAILED: %s (%.1fs) -- %s", cell_name, time.perf_counter() - t0, msg)
+        return {
+            "intervention": intervention,
+            "target_gap": target_gap,
+            "variant": variant,
+            "accuracy": float("nan"),
+            "auc": float("nan"),
+            "dp_gap": float("nan"),
+            "eo_gap": float("nan"),
+            "error": msg,
+        }
+
+
+CELL_CHOICES = [
+    "unmitigated",
+    "reweighing",
+    "expgrad-dp-uniform",
+    "expgrad-dp-stratified",
+    "expgrad-eo-uniform",
+    "expgrad-eo-stratified",
+    "threshold-dp-naive",
+    "threshold-dp-honest",
+    "threshold-eo-naive",
+    "threshold-eo-honest",
+]
+
+
 def run_condition(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -73,9 +125,11 @@ def run_condition(
     X_test: pd.DataFrame,
     y_test: pd.Series,
     A_test: pd.Series,
-    interventions: list[str],
+    cells: list[str],
     expgrad_subsample: int,
+    min_per_group: int,
     seed: int,
+    threshold_calib_frac: float,
 ) -> list[dict[str, Any]]:
     preprocessor = make_preprocessor()
     # XGBoost hist accepts the dense output from make_preprocessor() directly.
@@ -91,49 +145,77 @@ def run_condition(
         X_train_pre.shape[1],
     )
 
-    to_run = set(interventions)
+    to_run = set(cells)
     results: list[dict[str, Any]] = []
 
+    # Re-seed before every cell so each (intervention, target_gap) starts from
+    # an identical RNG state regardless of cell ordering. See train_grid.py
+    # for the longer rationale; the short version is: this makes
+    # `--cells expgrad-eo` bit-identical whether run alone or alongside
+    # expgrad-dp/threshold-*, and restores bit-equivalence with the pre-DP/EO
+    # split MST grid.
     if "unmitigated" in to_run:
+        set_seeds(seed)
         logging.info("running: unmitigated ...")
-        t0 = time.perf_counter()
-        r = run_unmitigated(X_train_pre, y_train, X_test_pre, y_test, A_test)
-        logging.info("done: unmitigated (%.1fs)  %s", time.perf_counter() - t0, r)
-        results.append(r)
+        results.append(_safe_call(
+            "unmitigated", "unmitigated", "none", "none",
+            lambda: run_unmitigated(X_train_pre, y_train, X_test_pre, y_test, A_test),
+        ))
 
-    if "reweighting" in to_run:
-        logging.info("running: reweighting ...")
-        t0 = time.perf_counter()
+    if "reweighing" in to_run:
+        set_seeds(seed)
+        logging.info("running: reweighing (target_gap=dp) ...")
         rw_preprocessor = make_preprocessor()
         rw_preprocessor.fit(X_train)
         X_test_pre_rw = rw_preprocessor.transform(X_test)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = run_reweighting(X_train, y_train, A_train, rw_preprocessor, X_test_pre_rw, y_test, A_test)
-        logging.info("done: reweighting (%.1fs)  %s", time.perf_counter() - t0, r)
-        results.append(r)
+        def _rw_thunk():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return run_reweighing(
+                    X_train, y_train, A_train, rw_preprocessor, X_test_pre_rw, y_test, A_test
+                )
+        results.append(_safe_call(
+            "reweighing", "reweighing", "dp", "none", _rw_thunk,
+        ))
 
-    if "expgrad" in to_run:
-        logging.info("running: expgrad (max_iter=50) ...")
-        t0 = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = run_expgrad(
-                X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
-                subsample=expgrad_subsample,
-                seed=seed,
-            )
-        logging.info("done: expgrad (%.1fs)  %s", time.perf_counter() - t0, r)
-        results.append(r)
+    for tg in ("dp", "eo"):
+        for sampler in ("uniform", "stratified"):
+            cell = f"expgrad-{tg}-{sampler}"
+            if cell not in to_run:
+                continue
+            set_seeds(seed)
+            logging.info("running: expgrad target_gap=%s sampler=%s (max_iter=50) ...", tg, sampler)
+            def _eg_thunk(tg=tg, sampler=sampler):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    return run_expgrad(
+                        X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
+                        subsample=expgrad_subsample,
+                        min_per_group=min_per_group,
+                        seed=seed,
+                        target_gap=tg,
+                        sampler=sampler,
+                    )
+            results.append(_safe_call(cell, "expgrad", tg, sampler, _eg_thunk))
 
-    if "threshold" in to_run:
-        logging.info("running: threshold ...")
-        t0 = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = run_threshold(X_train_pre, y_train, A_train, X_test_pre, y_test, A_test)
-        logging.info("done: threshold (%.1fs)  %s", time.perf_counter() - t0, r)
-        results.append(r)
+    for tg in ("dp", "eo"):
+        for mode in ("naive", "honest"):
+            cell = f"threshold-{tg}-{mode}"
+            if cell not in to_run:
+                continue
+            set_seeds(seed)
+            logging.info("running: threshold target_gap=%s mode=%s ...", tg, mode)
+            def _th_thunk(tg=tg, mode=mode):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    return run_threshold(
+                        X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
+                        target_gap=tg,
+                        mode=mode,
+                        calib_frac=threshold_calib_frac,
+                        split_seed=seed,
+                    )
+            results.append(_safe_call(cell, "threshold", tg, mode, _th_thunk))
 
     return results
 
@@ -173,10 +255,14 @@ def parse_args() -> argparse.Namespace:
         help="Synthetic data seed for this task (0-indexed).",
     )
     p.add_argument(
-        "--interventions",
+        "--cells",
         nargs="+",
-        choices=["unmitigated", "reweighting", "expgrad", "threshold"],
-        default=["unmitigated", "reweighting", "expgrad", "threshold"],
+        choices=CELL_CHOICES,
+        default=CELL_CHOICES,
+        help=(
+            "Subset of (intervention, target_gap) cells to run. "
+            "Default: all six. Note: reweighing is DP-only by construction."
+        ),
     )
     p.add_argument(
         "--expgrad-subsample",
@@ -184,6 +270,20 @@ def parse_args() -> argparse.Namespace:
         default=20000,
         metavar="N",
         help="Rows subsampled per expgrad oracle call. 0 = full training set.",
+    )
+    p.add_argument(
+        "--min-per-group",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Minimum rows per RAC1P group in the stratified expgrad subsample.",
+    )
+    p.add_argument(
+        "--threshold-calib-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of synth train held out for ThresholdOptimizer.fit in "
+             "honest-mode threshold cells. Stratified on (y, RAC1P).",
     )
     p.add_argument(
         "--seed",
@@ -222,16 +322,23 @@ def main() -> None:
     results = run_condition(
         X_train, y_train, A_train,
         X_test, y_test, A_test,
-        interventions=args.interventions,
+        cells=args.cells,
         expgrad_subsample=args.expgrad_subsample,
+        min_per_group=args.min_per_group,
         seed=args.seed,
+        threshold_calib_frac=args.threshold_calib_frac,
     )
 
     for r in results:
         r["eps"] = args.epsilon
         r["synth_seed"] = args.synth_seed
 
-    df_out = pd.DataFrame(results)[["eps", "synth_seed", "intervention", "accuracy", "auc", "dp_gap", "eo_gap"]]
+    for r in results:
+        r.setdefault("error", "")
+    df_out = pd.DataFrame(results)[
+        ["eps", "synth_seed", "intervention", "target_gap", "variant",
+         "accuracy", "auc", "dp_gap", "eo_gap", "error"]
+    ]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output_dir / f"eps{eps_int}_seed{args.synth_seed}.csv"

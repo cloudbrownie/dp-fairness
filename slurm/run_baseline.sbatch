@@ -2,14 +2,18 @@
 #SBATCH --job-name=baseline
 #SBATCH --output=logs/baseline_%j.out
 #SBATCH --error=logs/baseline_%j.err
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=4G
-#SBATCH --time=4:00:00
+#SBATCH --time=1:00:00
 
-# Runs all four fairness interventions (unmitigated, reweighting, expgrad, threshold)
-# on the prepared ACS data. expgrad runs on the full training set (no subsample)
-# to guarantee all 9 RAC1P groups are represented in every oracle call.
-# Expected wall time: ~1.5-2 hrs (expgrad dominates); 4:00:00 is a safe buffer.
+# Clean LR baseline: runs all four fairness interventions (unmitigated,
+# reweighing, expgrad, threshold) on the prepared ACS data. expgrad
+# uses a STRATIFIED 20k subsample (min 200 per RAC1P group) for its
+# oracle calls - matches full-train-156k on the clean data within 3
+# decimal places at ~7x lower compute, and matches the sampling scheme
+# used in the grid runs so the clean/private comparison is like-for-like.
+#
+# Expected wall time: ~15-20 min (expgrad dominates at stratified-20k).
 
 set -euo pipefail
 
@@ -23,8 +27,6 @@ if [[ -f "${ROOT}/.venv/bin/activate" ]]; then
   source "${ROOT}/.venv/bin/activate"
 fi
 
-# Let BLAS use all allocated CPUs. expgrad's oracle calls are sequential so
-# multi-threaded BLAS per call is faster than single-threaded with no parallelism.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
@@ -32,5 +34,7 @@ export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 exec python train_baseline.py \
   --data-dir data/raw \
   --output-dir data/results \
-  --expgrad-subsample 0 \
+  --output-name baseline.csv \
+  --expgrad-subsample 20000 \
+  --min-per-group 200 \
   --seed 42

@@ -3,8 +3,8 @@
 #SBATCH --output=logs/mst_synth_%A_%a.out
 #SBATCH --error=logs/mst_synth_%A_%a.err
 #SBATCH --array=0-39
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
 #SBATCH --time=2:00:00
 
 # One array task = one (epsilon, seed). 40 tasks: eps in {1,2,4,8} × seed in 0..9
@@ -32,7 +32,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-NJOBS="${SLURM_CPUS_PER_TASK:-16}"
+NJOBS="${SLURM_CPUS_PER_TASK:-2}"
 
 exec python generate_synth_mst.py \
   --only-epsilon "${EPS}" \

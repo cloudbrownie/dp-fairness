@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Step 3: Clean baseline experiments on unperturbed ACS data.
+"""Clean baseline experiments on unperturbed ACS data (LogisticRegression).
 
 Four conditions, all evaluated on the fixed held-out test split:
   - unmitigated: plain LogisticRegression
-  - reweighting: aif360 Reweighing (pre-processing)
-  - expgrad: fairlearn ExponentiatedGradient (in-processing)
+  - reweighing: aif360 Reweighing (pre-processing)
+  - expgrad: fairlearn ExponentiatedGradient (in-processing, stratified oracle)
   - threshold: fairlearn ThresholdOptimizer (post-processing)
 
-Writes results/baseline.csv with columns:
+The expgrad oracle uses a STRATIFIED subsample of the training data (not
+uniform): every RAC1P group with at least --min-per-group rows contributes
+that many to each oracle call; smaller groups contribute all their rows.
+This replaces the original uniform-20k scheme, which was found to cause
+expgrad to converge on a degenerate dual on RAC1P (smallest groups absent
+from oracle calls -> ill-posed EqualizedOdds constraint -> classifier
+less fair than unmitigated). See project.md Task C1 for the full
+investigation; the stratified smoke at seed=42 matches the old
+full-train-156k baseline to 3 decimal places.
+
+Writes data/results/baseline.csv with columns:
   intervention, accuracy, auc, dp_gap, eo_gap
 """
 
@@ -26,16 +36,32 @@ import pandas as pd
 from aif360.sklearn.preprocessing import Reweighing
 from fairlearn.metrics import demographic_parity_difference, equalized_odds_difference
 from fairlearn.postprocessing import ThresholdOptimizer
-from fairlearn.reductions import EqualizedOdds, ExponentiatedGradient
+from fairlearn.reductions import DemographicParity, EqualizedOdds, ExponentiatedGradient
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from stratified import per_group_counts, stratified_subsample_idx
 
 CAT_COLS = ["COW", "SCHL", "MAR", "OCCP", "POBP", "RELP", "SEX", "RAC1P"]
 NUM_COLS = ["AGEP", "WKHP"]
 TARGET = "PINCP"
 PROT_ATTR = "RAC1P"
+
+CELL_CHOICES = [
+    "unmitigated",
+    "reweighing",
+    "expgrad-dp-uniform",
+    "expgrad-dp-stratified",
+    "expgrad-eo-uniform",
+    "expgrad-eo-stratified",
+    "threshold-dp-naive",
+    "threshold-dp-honest",
+    "threshold-eo-naive",
+    "threshold-eo-honest",
+]
 
 
 def set_seeds(seed: int) -> None:
@@ -118,7 +144,7 @@ def run_unmitigated(
     return {"intervention": "unmitigated", **compute_metrics(y_test, y_pred, y_score, A_test)}
 
 
-def run_reweighting(
+def run_reweighing(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     A_train: pd.Series,
@@ -127,8 +153,6 @@ def run_reweighting(
     y_test: pd.Series,
     A_test: pd.Series,
 ) -> dict[str, Any]:
-    # aif360 0.6.1 Reweighing.fit_transform(X, y) -> (X, sample_weight).
-    # prot_attr must be present as a named index level, not a column.
     X_rw = X_train.reset_index(drop=True).copy()
     A_aligned = A_train.reset_index(drop=True).rename(PROT_ATTR)
     X_rw = X_rw.set_index(A_aligned)
@@ -144,9 +168,9 @@ def run_reweighting(
     clf.fit(X_rw_pre, y_rw, sample_weight=sample_weight)
     y_pred = clf.predict(X_test_pre)
     y_score = clf.predict_proba(X_test_pre)[:, 1]
-    return {"intervention": "reweighting", **compute_metrics(y_test, y_pred, y_score, A_test)}
+    return {"intervention": "reweighing", **compute_metrics(y_test, y_pred, y_score, A_test)}
 
-
+# note to future, max_iter of 50 works. observed convergence within 20-40 iters
 def run_expgrad(
     X_train_pre: np.ndarray,
     y_train: pd.Series,
@@ -154,20 +178,46 @@ def run_expgrad(
     X_test_pre: np.ndarray,
     y_test: pd.Series,
     A_test: pd.Series,
-    subsample: int = 0,
-    seed: int = 0,
+    subsample: int,
+    min_per_group: int,
+    seed: int,
+    *,
+    target_gap: str = "eo",
+    sampler: str = "stratified",
 ) -> dict[str, Any]:
     if subsample and subsample < len(y_train):
         rng = np.random.default_rng(seed)
-        idx = rng.choice(len(y_train), size=subsample, replace=False)
+        if sampler == "stratified":
+            idx = stratified_subsample_idx(
+                A_train, target_size=subsample, min_per_group=min_per_group, rng=rng
+            )
+        elif sampler == "uniform":
+            idx = rng.choice(len(y_train), size=subsample, replace=False)
+        else:
+            raise ValueError(f"sampler must be 'stratified' or 'uniform'; got {sampler!r}")
         X_fit = X_train_pre[idx]
         y_fit = y_train.iloc[idx]
         A_fit = A_train.iloc[idx]
-        logging.info("expgrad oracle subsample: %d / %d rows", subsample, len(y_train))
+        counts = per_group_counts(A_train, idx)
+        logging.info(
+            "expgrad %s subsample: %d rows across %d groups (min_per_group=%d)",
+            sampler, len(idx), len(counts), min_per_group,
+        )
+        logging.info("expgrad per-group counts: %s", counts)
     else:
         X_fit, y_fit, A_fit = X_train_pre, y_train, A_train
+        logging.info("expgrad subsample disabled or >= train size: using full train (%d rows)", len(y_train))
 
-    constraint = EqualizedOdds()
+    if target_gap == "eo":
+        constraint: Any = EqualizedOdds()
+    elif target_gap == "dp":
+        constraint = DemographicParity()
+    else:
+        raise ValueError(f"target_gap must be 'eo' or 'dp'; got {target_gap!r}")
+    logging.info(
+        "expgrad target_gap=%s constraint=%s sampler=%s",
+        target_gap, type(constraint).__name__, sampler,
+    )
     eg = ExponentiatedGradient(
         base_clf(),
         constraint,
@@ -177,9 +227,36 @@ def run_expgrad(
     eg.fit(X_fit, y_fit, sensitive_features=A_fit)
     logging.info("expgrad oracle calls: %d", eg.n_oracle_calls_)
     y_pred = eg.predict(X_test_pre)
-    # ExponentiatedGradient does not expose predict_proba; use 0/1 as score.
     y_score = y_pred.astype(float)
     return {"intervention": "expgrad", **compute_metrics(y_test, y_pred, y_score, A_test)}
+
+
+def _stratified_fit_calib_split(
+    n: int,
+    y: pd.Series,
+    A: pd.Series,
+    calib_frac: float,
+    split_seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Joint (y, A) strata. Fail loudly if any cell is too small to split.
+    strata = (A.astype(str) + "|" + y.astype(str)).to_numpy()
+    strata_counts = pd.Series(strata).value_counts()
+    n_calib_per_stratum = (strata_counts * calib_frac).round().astype(int)
+    if (strata_counts - n_calib_per_stratum < 1).any() or (n_calib_per_stratum < 1).any():
+        bad = strata_counts[(strata_counts - n_calib_per_stratum < 1) | (n_calib_per_stratum < 1)]
+        raise ValueError(
+            f"(y, A) stratified split with calib_frac={calib_frac} leaves a stratum empty. "
+            f"Offending strata (count): {bad.to_dict()}"
+        )
+    all_idx = np.arange(n)
+    fit_idx, calib_idx = train_test_split(
+        all_idx,
+        test_size=calib_frac,
+        random_state=split_seed,
+        shuffle=True,
+        stratify=strata,
+    )
+    return fit_idx, calib_idx
 
 
 def run_threshold(
@@ -189,26 +266,63 @@ def run_threshold(
     X_test_pre: np.ndarray,
     y_test: pd.Series,
     A_test: pd.Series,
+    *,
+    target_gap: str = "eo",
+    mode: str = "naive",
+    calib_frac: float = 0.2,
+    split_seed: int | None = None,
 ) -> dict[str, Any]:
-    # Fit the base estimator first, then wrap.
-    clf = base_clf()
-    clf.fit(X_train_pre, y_train)
+    if target_gap == "eo":
+        constraints_str = "equalized_odds"
+    elif target_gap == "dp":
+        constraints_str = "demographic_parity"
+    else:
+        raise ValueError(f"target_gap must be 'eo' or 'dp'; got {target_gap!r}")
+    if mode not in ("naive", "honest"):
+        raise ValueError(f"mode must be 'naive' or 'honest'; got {mode!r}")
+    logging.info(
+        "threshold target_gap=%s constraints=%s mode=%s",
+        target_gap, constraints_str, mode,
+    )
+
+    if mode == "naive":
+        clf = base_clf()
+        clf.fit(X_train_pre, y_train)
+        X_cal_pre, y_cal, A_cal = X_train_pre, y_train, A_train
+    else:
+        n = X_train_pre.shape[0]
+        fit_idx, calib_idx = _stratified_fit_calib_split(
+            n,
+            y_train,
+            A_train,
+            calib_frac=calib_frac,
+            split_seed=split_seed if split_seed is not None else 0,
+        )
+        logging.info(
+            "threshold honest split: n=%d fit=%d calibrate=%d calib_frac=%.3f",
+            n, len(fit_idx), len(calib_idx), calib_frac,
+        )
+        clf = base_clf()
+        clf.fit(X_train_pre[fit_idx], y_train.iloc[fit_idx])
+        X_cal_pre = X_train_pre[calib_idx]
+        y_cal = y_train.iloc[calib_idx]
+        A_cal = A_train.iloc[calib_idx]
 
     to = ThresholdOptimizer(
         estimator=clf,
-        constraints="equalized_odds",
+        constraints=constraints_str,
         objective="balanced_accuracy_score",
         prefit=True,
         predict_method="predict_proba",
     )
-    to.fit(X_train_pre, y_train, sensitive_features=A_train)
+    to.fit(X_cal_pre, y_cal, sensitive_features=A_cal)
     y_pred = to.predict(X_test_pre, sensitive_features=A_test)
     y_score = clf.predict_proba(X_test_pre)[:, 1]
     return {"intervention": "threshold", **compute_metrics(y_test, y_pred, y_score, A_test)}
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Clean baseline experiments (Step 3).")
+    p = argparse.ArgumentParser(description="Clean LR baseline (stratified expgrad).")
     p.add_argument(
         "--data-dir",
         type=Path,
@@ -218,16 +332,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results"),
-        help="Directory for baseline.csv.",
+        default=Path("data/results"),
+        help="Directory for the output CSV.",
     )
     p.add_argument("--seed", type=int, default=42, help="RNG seed.")
     p.add_argument(
-        "--interventions",
+        "--cells",
         nargs="+",
-        choices=["unmitigated", "reweighting", "expgrad", "threshold"],
-        default=["unmitigated", "reweighting", "expgrad", "threshold"],
-        help="Subset of interventions to run.",
+        choices=CELL_CHOICES,
+        default=CELL_CHOICES,
+        help=(
+            "Subset of (intervention, target_gap) cells to run. "
+            "Default: all six. Note: reweighing is DP-only by construction."
+        ),
     )
     p.add_argument(
         "--expgrad-subsample",
@@ -237,17 +354,39 @@ def parse_args() -> argparse.Namespace:
         help="Rows subsampled per expgrad oracle call. 0 = full training set.",
     )
     p.add_argument(
+        "--min-per-group",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Minimum rows per RAC1P group in the stratified expgrad subsample.",
+    )
+    p.add_argument(
+        "--threshold-calib-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of synth train held out for ThresholdOptimizer.fit in "
+             "honest-mode threshold cells. Stratified on (y, RAC1P).",
+    )
+    p.add_argument(
         "--output-name",
         type=str,
         default="baseline.csv",
-        help="Output filename under --output-dir (default: baseline.csv).",
+        help="Output filename under --output-dir.",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+        force=True,
+        handlers=[logging.StreamHandler()],
+    )
+    logging.getLogger().handlers[0].stream = open(  # noqa: SIM115
+        "/dev/stderr", "w", buffering=1
+    )
     set_seeds(args.seed)
     logging.info("config: %s", vars(args))
 
@@ -273,50 +412,83 @@ def main() -> None:
     )
 
     results: list[dict[str, Any]] = []
-    to_run = set(args.interventions)
+    to_run = set(args.cells)
 
+    # Re-seed before every cell so each (intervention, target_gap, variant)
+    # starts from an identical RNG state regardless of cell ordering.
+    # Mirrors the grid driver's behavior; see train_grid.py for the rationale.
     if "unmitigated" in to_run:
+        set_seeds(args.seed)
         logging.info("running: unmitigated")
         r = run_unmitigated(X_train_pre, y_train, X_test_pre, y_test, A_test)
+        r["target_gap"] = "none"
+        r["variant"] = "none"
         results.append(r)
         logging.info("  %s", r)
 
-    if "reweighting" in to_run:
-        logging.info("running: reweighting")
-        # Reweighting refits preprocessor internally; pass a fresh clone.
+    if "reweighing" in to_run:
+        set_seeds(args.seed)
+        logging.info("running: reweighing (target_gap=dp)")
         rw_preprocessor = make_preprocessor()
-        rw_preprocessor.fit(X_train)  # fit once so test transform is valid
+        rw_preprocessor.fit(X_train)
         X_test_pre_rw = rw_preprocessor.transform(X_test)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            r = run_reweighting(X_train, y_train, A_train, rw_preprocessor, X_test_pre_rw, y_test, A_test)
+            r = run_reweighing(X_train, y_train, A_train, rw_preprocessor, X_test_pre_rw, y_test, A_test)
+        r["target_gap"] = "dp"
+        r["variant"] = "none"
         results.append(r)
         logging.info("  %s", r)
 
-    if "expgrad" in to_run:
-        logging.info("running: expgrad (max_iter=50) ...")
-        t0 = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = run_expgrad(
-                X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
-                subsample=args.expgrad_subsample,
-                seed=args.seed,
-            )
-        logging.info("done: expgrad (%.1fs)  %s", time.perf_counter() - t0, r)
-        results.append(r)
+    for tg in ("dp", "eo"):
+        for sampler in ("uniform", "stratified"):
+            cell = f"expgrad-{tg}-{sampler}"
+            if cell not in to_run:
+                continue
+            set_seeds(args.seed)
+            logging.info("running: expgrad target_gap=%s sampler=%s ...", tg, sampler)
+            t0 = time.perf_counter()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                r = run_expgrad(
+                    X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
+                    subsample=args.expgrad_subsample,
+                    min_per_group=args.min_per_group,
+                    seed=args.seed,
+                    target_gap=tg,
+                    sampler=sampler,
+                )
+            r["target_gap"] = tg
+            r["variant"] = sampler
+            logging.info("done: expgrad-%s-%s (%.1fs)  %s", tg, sampler, time.perf_counter() - t0, r)
+            results.append(r)
 
-    if "threshold" in to_run:
-        logging.info("running: threshold")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = run_threshold(X_train_pre, y_train, A_train, X_test_pre, y_test, A_test)
-        results.append(r)
-        logging.info("  %s", r)
+    for tg in ("dp", "eo"):
+        for mode in ("naive", "honest"):
+            cell = f"threshold-{tg}-{mode}"
+            if cell not in to_run:
+                continue
+            set_seeds(args.seed)
+            logging.info("running: threshold target_gap=%s mode=%s", tg, mode)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                r = run_threshold(
+                    X_train_pre, y_train, A_train, X_test_pre, y_test, A_test,
+                    target_gap=tg,
+                    mode=mode,
+                    calib_frac=args.threshold_calib_frac,
+                    split_seed=args.seed,
+                )
+            r["target_gap"] = tg
+            r["variant"] = mode
+            results.append(r)
+            logging.info("  %s", r)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output_dir / args.output_name
-    df_out = pd.DataFrame(results)
+    df_out = pd.DataFrame(results)[
+        ["intervention", "target_gap", "variant", "accuracy", "auc", "dp_gap", "eo_gap"]
+    ]
     df_out.to_csv(out_path, index=False)
     logging.info("wrote %s", out_path)
     print(df_out.to_string(index=False))
