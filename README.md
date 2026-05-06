@@ -1,120 +1,174 @@
-# DP Fairness Interventions Study
+# DP Synthetic Data × Fairness Interventions
 
-This project studies how **differentially private (DP) synthetic data generation** interacts with **algorithmic fairness interventions**. We generate synthetic versions of a real census-derived income dataset at multiple privacy budgets (ε), train classifiers on the synthetic data alone, and measure how well three fairness interventions (reweighting, exponentiated gradient, threshold adjustment) recover equalized odds compared to a clean-data baseline.
+Pipeline for studying how differentially private (DP) synthetic data interacts
+with three fairness interventions (reweighing, exponentiated gradient,
+threshold optimizer) on the Folktables `ACSIncome` task (California 2018,
+~195k rows). The grid crosses two synthesizers (MST, PrivBayes) with two
+model families (LogisticRegression, XGBoost) at ε ∈ {1, 2, 4, 8}, 10 seeds
+each, and is post-processed by a battery of analysis drivers in
+`analysis/`.
 
-## Dataset and connection to the US Census
+## Repo layout
 
-We use the **ACS PUMS Income** task from [Folktables](https://github.com/socialfoundations/folktables), constructed from the 2018 American Community Survey Public Use Microdata Sample (PUMS) for California. The ACS is conducted annually by the US Census Bureau as the primary source of detailed socioeconomic statistics between decennial censuses. The Folktables `ACSIncome` task replicates the adult income classification benchmark on this data:
-
-- **Target**: whether personal income (`PINCP`) exceeds $50,000
-- **Features**: age, class of worker, education, marital status, occupation, place of birth, relationship, usual hours worked, sex, race (10 columns)
-- **Protected attributes**: `RAC1P` (race, 1–9) and `SEX` (1=Male, 2=Female)
-- **Population**: adults in California who worked at least some hours (≈195k rows after the standard `adult_filter`)
-
-**Synthetic data and the Census connection.** The synthetic datasets are produced by the **MST (Maximum Spanning Tree) mechanism** implemented in the [`dpmm`](https://github.com/ryan112358/private-pgm) library — the same class of graphical-model mechanisms underlying the Census Bureau's **TopDown algorithm** used for the 2020 Decennial Census. Step 5 of the pipeline validates this connection by comparing the group-level distortions in our MST synthetic data against the TopDown distortions published by NHGIS in their 2010 DP demonstration files.
-
-## Environment setup
-
-The project uses [uv](https://docs.astral.sh/uv/) for deterministic environment management. All dependencies and their pinned versions are declared in `pyproject.toml`; `uv.lock` ensures exact reproducibility.
-
-```bash
-# 1. Install uv (once per machine — skip if already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Create the virtual environment and install all dependencies
-#    (run from the project root)
-uv sync
-
-# 3. Activate (optional — uv run prefix works without activation)
-source .venv/bin/activate
+```
+.
+├── prepare_acs_data.py        # Step 1: ACS download + train/test split
+├── generate_synth_mst.py      # Step 2a: MST synth     -> data/synth/
+├── generate_synth_pb.py       # Step 2b: PrivBayes synth -> data/synth_pb/
+├── train_baseline.py          # Step 3a: clean LR baseline   -> data/results/baseline.csv
+├── train_baseline_xgb.py      # Step 3b: clean XGB baseline  -> data/results/baseline_xgb.csv
+├── train_grid.py              # Step 4a: LR  × MST       -> data/results/grid/
+├── train_grid_xgb.py          # Step 4b: XGB × MST       -> data/results/grid_xgb/
+│                              # (same scripts also drive _pb / _xgb_pb via --synth-dir)
+├── analysis/                  # Step 5: summarisation, stats, plots
+│   ├── make_*.py              #   tables (raw_summary, ratios, risk, wilcoxon, ...)
+│   ├── plot_*.py              #   figures (headline_bar, eps_sweep, heatmap, ...)
+│   └── io.py / metrics.py / stats_tests.py / palette.py / style.py
+├── run_all.py                 # orchestrator for the analysis/ pipeline
+├── interventions.py, metrics.py, driver.py, run_grid.py
+│                              # legacy single-source driver (superseded by train_grid*.py)
+├── stratified.py              # stratified expgrad oracle subsample helper
+├── smoke_test.py              # checks dpmm/folktables/fairlearn/aif360 imports + tiny MST run
+├── slurm/                     # one sbatch per (synth, model) cell
+├── pyproject.toml / uv.lock   # pinned dependencies (uv)
+└── data/                      # all inputs and outputs (see below)
 ```
 
-`uv sync` reads `pyproject.toml` and `uv.lock` and installs the exact pinned versions into `.venv/`. Do not use `pip install` directly — it will not respect the lockfile.
-
-To add a new dependency:
-
-```bash
-uv add <package>          # adds to pyproject.toml and updates uv.lock
-uv sync                   # installs into .venv
-```
-
-## Data pipeline
-
-### Step 1 — ACS download and preparation (already done)
-
-Outputs are in `data/raw/`. To regenerate from scratch:
-
-```bash
-python prepare_acs_data.py \
-  --output-dir data/raw \
-  --folktables-root data \
-  --format pickle \
-  --seed 42
-```
-
-This downloads the 2018 ACS PUMS for California (~195k rows), performs a stratified 80/20 train/test split (fixed at seed 42), and writes:
-
-| File | Contents |
-|------|----------|
-| `data/raw/acs_prepared.pkl` | Full DataFrame (features + PINCP label) |
-| `data/raw/idx_train.npy` | Training row indices |
-| `data/raw/idx_test.npy` | Test row indices (never used for fitting) |
-| `data/raw/domain.json` | dpmm domain spec (bounds for numeric cols, categories for categorical cols) |
-
-The domain spec is passed to `MSTPipeline` so no DP budget is spent on domain estimation.
-
-### Step 2 — DP synthetic data generation (already done)
-
-Outputs are 40 parquet files in `data/synth/`: `eps{1,2,4,8}_seed{0..9}.parquet`. Each file contains a synthetic training set of the same size as the real training split, with the same schema (features + `PINCP`).
-
-**To regenerate a single cell** (e.g. ε=2, seed=3):
-
-```bash
-python generate_synth_mst.py \
-  --data-dir data/raw \
-  --output-dir data/synth \
-  --only-epsilon 2 \
-  --only-seed 3
-```
-
-**To regenerate the full grid on a Slurm cluster:**
-
-```bash
-# Option A: array job (40 tasks × ~10 min each, runs in parallel)
-sbatch slurm/generate_synth_mst_array_short.sbatch
-
-# Option B: single job, all 40 runs sequentially on one node
-sbatch slurm/generate_synth_mst_serial.sbatch
-```
-
-The array job (`_array_short`) is preferred — each task takes under 10 minutes and the whole grid finishes in a single scheduler slot per task. The serial job is simpler to monitor when debugging.
-
-Privacy parameters: ε ∈ {1, 2, 4, 8}, δ = 1/n² where n is the number of training rows, `proc_epsilon=0.1`.
-
-### Step 3 — Clean baseline
-
-```bash
-python train_baseline.py \
-  --data-dir data/raw \
-  --output-dir results \
-  --seed 42
-```
-
-Trains and evaluates four conditions on clean data (unmitigated + reweighting + exponentiated gradient + threshold adjustment). Writes `results/baseline.csv`.
-
-## Output structure
+## Data layout
 
 ```
 data/
-  raw/            # ACS parquet/pkl, split indices, domain.json
-  synth/          # eps{e}_seed{s}.parquet (40 files)
-  nhgis/          # NHGIS 2010 DP demonstration files (Step 5)
-results/
-  baseline.csv    # clean baseline metrics (Step 3)
-  grid.csv        # full (eps, seed, intervention) results (Step 4)
-  nhgis_check.csv # distortion comparison (Step 5)
-logs/             # Slurm stdout/stderr
+├── 2018/                       # raw Folktables download cache
+├── raw/
+│   ├── acs_prepared.pkl        # full DataFrame (features + PINCP)
+│   ├── idx_train.npy           # 80% train indices (seed 42)
+│   ├── idx_test.npy            # 20% held-out test indices
+│   └── domain.json             # dpmm domain spec (no DP budget on schema)
+├── synth/                      # MST synth, 40 files: eps{1,2,4,8}_seed{0..9}.parquet
+├── synth_pb/                   # PrivBayes synth, same naming
+├── results/
+│   ├── baseline.csv            # clean LR  (4 interventions)
+│   ├── baseline_xgb.csv        # clean XGB (4 interventions)
+│   ├── grid/                   # LR  × MST       eps{e}_seed{s}.csv (10 cells/file)
+│   ├── grid_pb/                # LR  × PrivBayes
+│   ├── grid_xgb/               # XGB × MST
+│   └── grid_xgb_pb/            # XGB × PrivBayes
+└── analysis/                   # everything written by run_all.py
+    ├── raw_summary/            # raw_summary.csv, raw_summary_target.csv
+    ├── ratios/                 # ratios_long.csv, ratios_summary.csv, attenuation.csv
+    ├── risk/                   # risk_summary.csv
+    ├── wilcoxon/               # wilcoxon.csv
+    ├── side_effects/           # side_effects_summary.csv, side_effects_wilcoxon.csv
+    ├── variant_tests/          # mst_vs_privbayes, logreg_vs_xgboost,
+    │                           # expgrad_uniform_vs_stratified, threshold_naive_vs_honest
+    ├── plateau/  pareto/  failures/
+    └── plots/                  # headline_bar, headline_delta, eps_sweep_*,
+                                # forest_target_gap, heatmap_target_gap,
+                                # accuracy_gap_scatter{,_dp,_eo}.png
 ```
+
+Each grid CSV row is one (intervention, target_gap, variant) cell:
+
+```
+eps, synth_seed, intervention, target_gap, variant, accuracy, auc, dp_gap, eo_gap
+```
+
+with the ten cells per (eps, seed) being:
+
+| intervention  | target_gap | variant            |
+|---------------|------------|--------------------|
+| unmitigated   | none       | none               |
+| reweighing    | dp         | none               |
+| expgrad       | dp / eo    | uniform / stratified |
+| threshold     | dp / eo    | naive / honest     |
+
+Both `dp_gap` and `eo_gap` are reported on every row regardless of
+`target_gap`, so the off-target gap is a side-effect measurement.
+
+## Environment
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # once per machine
+uv sync                                           # creates .venv/ from uv.lock
+source .venv/bin/activate                         # optional; `uv run <cmd>` also works
+```
+
+Python is pinned to 3.11; key deps: `dpmm==0.1.9`, `folktables==0.0.12`,
+`fairlearn==0.13.0`, `aif360==0.6.1`, `xgboost==3.2.0`,
+`scikit-learn==1.5.0`, `numpy==1.26.4`, `pandas==2.1.0`. Use
+`uv add <pkg>` rather than bare `pip install` to keep the lockfile honest.
+
+## Running the pipeline
+
+### Step 1 — ACS prep (already cached in `data/raw/`)
+
+```bash
+python prepare_acs_data.py --output-dir data/raw --folktables-root data --format pickle --seed 42
+```
+
+### Step 2 — DP synthetic data
+
+Single cell:
+
+```bash
+python generate_synth_mst.py --data-dir data/raw --output-dir data/synth    --only-epsilon 2 --only-seed 3
+python generate_synth_pb.py  --data-dir data/raw --output-dir data/synth_pb --only-epsilon 2 --only-seed 3
+```
+
+Full 4 × 10 grid on Slurm:
+
+```bash
+sbatch slurm/generate_synth_mst_array.sbatch
+sbatch slurm/generate_synth_pb_array.sbatch
+```
+
+Privacy parameters: ε ∈ {1, 2, 4, 8}, δ = 1/n², `proc_epsilon=0.1`.
+
+### Step 3 — Clean baselines
+
+```bash
+python train_baseline.py     --data-dir data/raw --output-dir data/results --seed 42
+python train_baseline_xgb.py --data-dir data/raw --output-dir data/results --seed 42
+```
+
+Or via Slurm: `sbatch slurm/run_baseline.sbatch` / `run_baseline_xgb.sbatch`.
+
+### Step 4 — Synth × intervention grid
+
+Per cell (one synth file → 10 result rows):
+
+```bash
+python train_grid.py     --synth-dir data/synth    --output-dir data/results/grid     --eps 2 --synth-seed 3
+python train_grid_xgb.py --synth-dir data/synth_pb --output-dir data/results/grid_xgb_pb --eps 2 --synth-seed 3
+```
+
+Full grids on Slurm — one array task per (eps, seed) per (model, synth):
+
+```bash
+sbatch slurm/run_grid_array.sbatch          # LR  × MST
+sbatch slurm/run_grid_pb_array.sbatch       # LR  × PrivBayes
+sbatch slurm/run_grid_xgb_array.sbatch      # XGB × MST
+sbatch slurm/run_grid_xgb_pb_array.sbatch   # XGB × PrivBayes
+```
+
+### Step 5 — Analysis (tables + plots)
+
+```bash
+python run_all.py
+```
+
+`run_all.py` is a flag-free orchestrator: each module under `analysis/`
+uses its own argparse defaults (read from `data/results/`, write under
+`data/analysis/<artifact>/`). Modules can also be invoked individually,
+e.g. `python -m analysis.make_ratios` or `python -m analysis.plot_heatmap`.
+
+Pipeline order (mirrors `PIPELINE` in `run_all.py`):
+
+1. tables: `make_failures`, `make_raw_summary`, `make_ratios`, `make_risk`,
+   `make_wilcoxon`, `make_side_effects`, `make_variant_tests`,
+   `make_plateau`, `make_pareto`
+2. plots: `plot_headline_bar`, `plot_headline_delta`, `plot_eps_sweep`,
+   `plot_forest`, `plot_heatmap`, `plot_scatter`
 
 ## Smoke test
 
@@ -122,4 +176,5 @@ logs/             # Slurm stdout/stderr
 python smoke_test.py
 ```
 
-Verifies that the dpmm, folktables, fairlearn, and aif360 imports work and that a small MST fit+generate cycle completes without errors.
+Verifies that `dpmm`, `folktables`, `fairlearn`, and `aif360` import and
+that a tiny MST fit + sample completes end-to-end.
